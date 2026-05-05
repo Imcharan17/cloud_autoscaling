@@ -1,0 +1,196 @@
+import collections
+from datetime import timedelta
+
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+from forecaster.Test_Models.CatBoost import CatBoost
+from forecaster.Test_Models.FacebookProphet import FacebookProphet
+from forecaster.Test_Models.LSTM import LSTM
+from forecaster.Test_Models.LightGBM import LightGBM
+from forecaster.Test_Models.LinearRegression import LinearRegression
+from forecaster.Test_Models.MovingAverage import MovingAverage
+from forecaster.Test_Models.NBeats import NBeats
+from forecaster.Test_Models.NHits import NHits
+from forecaster.Test_Models.SVMPolynomialKernel import SVMPolynomialKernel
+from forecaster.Test_Models.SVMRBFKernel import SVMRBFKernel
+from forecaster.Test_Models.TFT import TFT
+from forecaster.Test_Models.TestModel import TestModel
+from forecaster.Test_Models.WeeklyAverage import WeeklyAverage
+from forecaster.Test_Models.XGBoost import XGBoost
+
+def build_models(model_set):
+    weeklyAverage = WeeklyAverage()
+    movingAverage = MovingAverage(2)
+    linearRegression = LinearRegression()
+    lightgbm = LightGBM()
+    tft_model = None
+    try:
+        from forecaster.Test_Models.TFT import TFT
+        tft_model = TFT(14, 1, 75)
+    except Exception as exc:
+        print("Skipping TFT model:", exc)
+
+    if model_set == "fast":
+        models = {
+            movingAverage.name: movingAverage,
+            weeklyAverage.name: weeklyAverage,
+            linearRegression.name: linearRegression,
+            lightgbm.name: lightgbm,
+        }
+        if tft_model is not None:
+            models[tft_model.name] = tft_model
+        return collections.ChainMap(models)
+    lstm = LSTM(14, 1)
+    lightgbm = LightGBM()
+    xgboost = XGBoost()
+    catboost = CatBoost()
+    svmPolynomialKernel = SVMPolynomialKernel()
+    svmRBFKernel = SVMRBFKernel()
+    facebookProphet = FacebookProphet()
+    NBeatsModel = NBeats(14, 1, 9)
+    NHitsModel = NHits(14, 1, 9)
+    TFTModel = TFT(14, 1, 75)
+
+    return collections.ChainMap({
+           lstm.name: lstm,
+           movingAverage.name: movingAverage,
+           weeklyAverage.name: weeklyAverage,
+           lightgbm.name: lightgbm,
+           xgboost.name: xgboost,
+           catboost.name: catboost,
+           facebookProphet.name: facebookProphet,
+           linearRegression.name: linearRegression,
+           svmPolynomialKernel.name: svmPolynomialKernel,
+           svmRBFKernel.name: svmRBFKernel,
+           NBeatsModel.name: NBeatsModel,
+           NHitsModel.name: NHitsModel,
+           TFTModel.name: TFTModel,
+            
+             
+        })
+
+def train_models_on_data(train_data, column_name, model_set):
+    test_models = build_models(model_set)
+
+    print('=========== Starting Model training process =========')
+    for key, val in test_models.items():
+        print('Training {} model'.format(key))
+        val.train_model(train_data, column_name)
+    print('=========== End Model training process =========')
+
+    return test_models
+
+
+def get_current_best_prediction_model(
+        actual_result_of_last_record,
+        previous_prediction,
+        train,
+        test_models,
+        column_name,
+        previous_best_model_name,
+):
+    best_rmse = mean_squared_error(actual_result_of_last_record[column_name], previous_prediction.iloc[:, -1:], squared=False)
+
+    current_best_model_name = previous_best_model_name
+    for key, val in test_models.items():
+        if (current_best_model_name == key):
+            continue
+        else:
+            proposed_previous_prediction = val.get_prediction(train, actual_result_of_last_record, column_name) \
+                .fillna(value=99999999)
+
+            if best_rmse == None:
+                best_rmse = mean_squared_error(actual_result_of_last_record[column_name], proposed_previous_prediction, squared=False)
+            else:
+                current_rmse = mean_squared_error(actual_result_of_last_record[column_name], proposed_previous_prediction,squared=False)
+                if current_rmse < best_rmse:
+                    best_rmse = current_rmse
+                    current_best_model_name = key
+
+    return test_models[current_best_model_name]
+
+
+class EnsembleModel(TestModel):
+    def __init__(self, backward_window, forward_window, period_scale, model_set="full"):
+        super().__init__("Ensemble_Model_with_bkWindow_{}_and_fdWindow_{}".format(backward_window, forward_window))
+        self.backward_window = backward_window
+        self.forward_window = forward_window
+        self.period_scale = period_scale
+        self.model_set = model_set
+
+    def run_model(self, train, test, column_name):
+        backward_window = self.backward_window
+        forward_window = self.forward_window
+        period_scale = self.period_scale
+
+        test_models = train_models_on_data(train, column_name, self.model_set)
+
+        current_test_records = train[-forward_window - 1:-1].reset_index(drop=True)
+        best_predictions = pd.DataFrame()
+
+        current_best_prediction_model = list(test_models.values())[0].name
+        use_fixed_model = (self.model_set == "fast")
+
+        step_end = None
+        if len(test) == 0:  # Means we are not testing the model but using it for actual prediction
+            step_end = forward_window
+        else:  # Means we are testing the model against test data
+            step_end = min(len(test), forward_window)
+
+        for idx in range(0, step_end, forward_window):
+            print("Prediction window start:", idx, "of", step_end)
+            if idx == 0:
+                print("Using model for initial prediction:", current_best_prediction_model)
+                predicted = test_models[current_best_prediction_model].get_prediction(train, current_test_records,
+                                                                                      column_name)
+                timestamp_for_predicted = train[-forward_window:]['timestamp_date_format'] + \
+                                          timedelta(minutes=int(period_scale[0:len(period_scale) - 3]))
+                best_predictions = pd.concat(
+                    [
+                        best_predictions,
+                        pd.concat(
+                            [timestamp_for_predicted.reset_index(drop=True),
+                             predicted.reset_index(drop=True)], axis=1)
+                    ],
+                    ignore_index=True)
+                continue
+            else:
+                previous_predicted_record_count = min(len(best_predictions), backward_window)
+
+                previous_prediction = best_predictions[-previous_predicted_record_count:].reset_index(drop=True)
+                actual_result_of_last_record = test[idx - previous_predicted_record_count:idx].reset_index(
+                    drop=True)
+
+                if use_fixed_model:
+                    current_best_test_model = test_models[current_best_prediction_model]
+                else:
+                    current_best_test_model = get_current_best_prediction_model(
+                        actual_result_of_last_record,
+                        previous_prediction,
+                        train,
+                        test_models,
+                        column_name,
+                        current_best_prediction_model
+                    )
+                print("Selected model for step:", idx, "->", current_best_test_model.name)
+                train = pd.concat([train, actual_result_of_last_record], ignore_index=True)
+                current_test_records = test[idx:min(len(test), idx + forward_window)].reset_index(drop=True)
+
+                predicted = current_best_test_model.get_prediction(train, current_test_records, column_name)
+                timestamp_for_predicted = test[idx:min(len(test), idx + forward_window)]['timestamp_date_format'] \
+                                          + timedelta(minutes=int(period_scale[0:len(period_scale) - 3]))
+
+                best_predictions = pd.concat(
+                    [
+                        best_predictions,
+                        pd.concat(
+                            [timestamp_for_predicted.reset_index(drop=True),
+                             predicted.reset_index(drop=True)], axis=1)
+                    ],
+                    ignore_index=True)
+                continue
+
+        print("EnsembleModel.run_model complete:", column_name, "predictions:", len(best_predictions))
+        if "timestamp_date_format" in best_predictions.columns:
+            best_predictions = best_predictions.set_index("timestamp_date_format")
+        return best_predictions["{}_Predicted".format(column_name)]
